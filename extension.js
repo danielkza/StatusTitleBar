@@ -2,8 +2,6 @@
  * StatusTitleBar extension
  * @autor: emerino <emerino at gmail dot com>
 
- * Some code reused (and some stolen) from ui.panel script.
- *
  * This extension replaces the original AppMenuButton from the
  * gnome-shell panel with a new AppMenuButton that shows the
  * title of the current focused window, when maximized, instead 
@@ -30,449 +28,71 @@ const Overview = imports.ui.overview;
 
 const PANEL_ICON_SIZE = 24;
 
-/** Utility functions **/
-/* Note : credit to the shellshape extension, from which these functions
- * are modified. https://extensions.gnome.org/extension/294/shellshape/
- * Signals are stored by the owner, storing both the target &
- * the id to clean up later.
- * 
- * Minor modifications by @emerino (we don't like obscure code)
- */
-function connectAndTrack(owner, subject, name, cb) {
-    if (!owner.hasOwnProperty('_StatusTitleBar_bound_signals')) {
-        owner._StatusTitleBar_bound_signals = [];
-    }
-
-    let id = subject.connect(name, cb);
-    owner._StatusTitleBar_bound_signals.push([subject, id]);
-}
-
-function disconnectTrackedSignals(owner) {
-    if (!owner || !owner._StatusTitleBar_bound_signals) { 
-        return; 
-    }
-
-    owner._StatusTitleBar_bound_signals.forEach(
-        function (sig) {
-            let subject = sig[0];
-            let id = sig[1];
-
-            subject.disconnect(id);
-        }
-    );
-
-    delete owner._StatusTitleBar_bound_signals;
-}
+const ExtensionUtils = imports.misc.extensionUtils;
+const Utils = ExtensionUtils.getCurrentExtension().imports.utils;
 
 /**
- * AppMenuButton:
+ * StatusTitleBarButton
  *
- * This class manages the "application menu" component.  It tracks the
- * currently focused application.  However, when an app is launched,
- * this menu also handles startup notification for it.  So when we
- * have an active startup notification, we switch modes to display that.
+ * This class manages the current title of focused maximized window and shows
+ * it in the status title bar of the panel.
+ *
  */
 const StatusTitleBarButton = new Lang.Class({
     Name: 'StatusTitleBarButton',
-    Extends: PanelMenu.Button,
+    Extends: Panel.AppMenuButton,
 
-    _init: function(menuManager) {
-        this.parent(0.0, null, true);
-
-        this.actor.accessible_role = Atk.Role.MENU;
-
-        this._startingApps = [];
-
-        this._menuManager = menuManager;
-        this._targetApp = null;
-        this._appMenuNotifyId = 0;
-        this._actionGroupNotifyId = 0;
-
-        let bin = new St.Bin({ name: 'windowTitle' });
-        this.actor.add_actor(bin);
-
-        this.actor.bind_property("reactive", this.actor, "can-focus", 0);
-        this.actor.reactive = false;
-        this._targetIsCurrent = false;
-
-        this._container = new Shell.GenericContainer();
-        bin.set_child(this._container);
-        this._container.connect('get-preferred-width', Lang.bind(this, this._getContentPreferredWidth));
-        this._container.connect('get-preferred-height', Lang.bind(this, this._getContentPreferredHeight));
-        this._container.connect('allocate', Lang.bind(this, this._contentAllocate));
-
-        this._iconBox = new Shell.Slicer({ name: 'appMenuIcon' });
-        this._iconBox.connect('style-changed',
-                              Lang.bind(this, this._onIconBoxStyleChanged));
-        this._iconBox.connect('notify::allocation',
-                              Lang.bind(this, this._updateIconBoxClip));
-        this._container.add_actor(this._iconBox);
-        this._label = new Panel.TextShadower();
-        this._container.add_actor(this._label.actor);
-
-        this._iconBottomClip = 0;
-
-        this._visible = !Main.overview.visible;
-        if (!this._visible)
-            this.actor.hide();
+    _init: function(panel) {
+        this.parent(panel);
 
         /*** Holders for local tracked signals ***/
         this._wsSignals = {};
-        this._targetAppSignals = {};
+        //this._targetAppSignals = {};
 
-        /* Track all globally connected signals ! */
-        connectAndTrack(this, Main.overview, 'hiding', Lang.bind(this, function () {
-            this.show();
-        }));
-        connectAndTrack(this, Main.overview, 'showing', Lang.bind(this, function () {
-            this.hide();
-        }));
+        Utils.connectAndTrack(this, global.window_manager, 'maximize',
+                Lang.bind(this, this._onRedimension));
+        Utils.connectAndTrack(this, global.window_manager, 'unmaximize',
+                Lang.bind(this, this._onRedimension));
 
-        this._stop = true;
+        Utils.connectAndTrack(this, global.screen, 'notify::n-workspaces',
+                Lang.bind(this, this._workspacesChanged));
 
-        this._spinner = new Panel.AnimatedIcon('process-working.svg',
-                                               PANEL_ICON_SIZE);
-        this._container.add_actor(this._spinner.actor);
-        this._spinner.actor.lower_bottom();
-
-        let tracker = Shell.WindowTracker.get_default();
-        let appSys = Shell.AppSystem.get_default();
-        connectAndTrack(this, tracker, 'notify::focus-app',
-                Lang.bind(this, this._focusAppChanged));
-        connectAndTrack(this, appSys, 'app-state-changed',
-                Lang.bind(this, this._onAppStateChanged));
-
-        connectAndTrack(this, global.window_manager, 'switch-workspace',
+        Utils.connectAndTrack(this, global.display, "notify::focus-window",
                 Lang.bind(this, this._sync));
 
-        /*** This is what this._sync() in the original _init is replaced with ***/
-        connectAndTrack(this, global.window_manager, 'maximize',
-                Lang.bind(this, this._onRedimension));
-        connectAndTrack(this, global.window_manager, 'unmaximize',
-                Lang.bind(this, this._onRedimension));
-
-        connectAndTrack(this, global.screen, 'notify::n-workspaces',
-                Lang.bind(this, this._changeWorkspaces));
-
         // if actor is destroyed, we must disconnect.
-        connectAndTrack(this, this.actor, 'destroy', Lang.bind(this, this.destroy));
+        Utils.connectAndTrack(this, this.actor, 'destroy', Lang.bind(this, this.destroy));
 
-        this._changeWorkspaces();
-    },
-
-    show: function() {
-        if (this._visible || Main.screenShield.locked)
-            return;
-
-        this._visible = true;
-        this.actor.show();
-
-        if (!this._targetIsCurrent)
-            return;
-
-        this.actor.reactive = true;
-
-        Tweener.removeTweens(this.actor);
-        Tweener.addTween(this.actor,
-                         { opacity: 255,
-                           time: Overview.ANIMATION_TIME,
-                           transition: 'easeOutQuad' });
-    },
-
-    hide: function() {
-        if (!this._visible)
-            return;
-
-        this._visible = false;
-        this.actor.reactive = false;
-        if (!this._targetIsCurrent) {
-            this.actor.hide();
-            return;
-        }
-
-        Tweener.removeTweens(this.actor);
-        Tweener.addTween(this.actor,
-                         { opacity: 0,
-                           time: Overview.ANIMATION_TIME,
-                           transition: 'easeOutQuad',
-                           onComplete: function() {
-                               this.actor.hide();
-                         },
-                         onCompleteScope: this });
-    },
-
-    _onIconBoxStyleChanged: function() {
-        let node = this._iconBox.get_theme_node();
-        this._iconBottomClip = node.get_length('app-icon-bottom-clip');
-        this._updateIconBoxClip();
-    },
-
-    _updateIconBoxClip: function() {
-        let allocation = this._iconBox.allocation;
-        if (this._iconBottomClip > 0)
-            this._iconBox.set_clip(0, 0,
-                                   allocation.x2 - allocation.x1,
-                                   allocation.y2 - allocation.y1 - this._iconBottomClip);
-        else
-            this._iconBox.remove_clip();
-    },
-
-    stopAnimation: function() {
-        if (this._stop)
-            return;
-
-        this._stop = true;
-        this.actor.reactive = true;
-        Tweener.addTween(this._spinner.actor,
-                         { opacity: 0,
-                           time: SPINNER_ANIMATION_TIME,
-                           transition: "easeOutQuad",
-                           onCompleteScope: this,
-                           onComplete: function() {
-                               this._spinner.actor.opacity = 255;
-                               this._spinner.actor.hide();
-                           }
-                         });
-    },
-
-    startAnimation: function() {
-        this._stop = false;
-        this.actor.reactive = false;
-        this._spinner.actor.show();
-    },
-
-    _getContentPreferredWidth: function(actor, forHeight, alloc) {
-        let [minSize, naturalSize] = this._iconBox.get_preferred_width(forHeight);
-        alloc.min_size = minSize;
-        alloc.natural_size = naturalSize;
-        [minSize, naturalSize] = this._label.actor.get_preferred_width(forHeight);
-        alloc.min_size = alloc.min_size + Math.max(0, minSize - Math.floor(alloc.min_size / 2));
-        alloc.natural_size = alloc.natural_size + Math.max(0, naturalSize - Math.floor(alloc.natural_size / 2));
-    },
-
-    _getContentPreferredHeight: function(actor, forWidth, alloc) {
-        let [minSize, naturalSize] = this._iconBox.get_preferred_height(forWidth);
-        alloc.min_size = minSize;
-        alloc.natural_size = naturalSize;
-        [minSize, naturalSize] = this._label.actor.get_preferred_height(forWidth);
-        if (minSize > alloc.min_size)
-            alloc.min_size = minSize;
-        if (naturalSize > alloc.natural_size)
-            alloc.natural_size = naturalSize;
-    },
-
-    _contentAllocate: function(actor, box, flags) {
-        let allocWidth = box.x2 - box.x1;
-        let allocHeight = box.y2 - box.y1;
-        let childBox = new Clutter.ActorBox();
-
-        let [minWidth, minHeight, naturalWidth, naturalHeight] = this._iconBox.get_preferred_size();
-
-        let direction = this.actor.get_text_direction();
-
-        let yPadding = Math.floor(Math.max(0, allocHeight - naturalHeight) / 2);
-        childBox.y1 = yPadding;
-        childBox.y2 = childBox.y1 + Math.min(naturalHeight, allocHeight);
-        if (direction == Clutter.TextDirection.LTR) {
-            childBox.x1 = 0;
-            childBox.x2 = childBox.x1 + Math.min(naturalWidth, allocWidth);
-        } else {
-            childBox.x1 = Math.max(0, allocWidth - naturalWidth);
-            childBox.x2 = allocWidth;
-        }
-        this._iconBox.allocate(childBox, flags);
-
-        let iconWidth = childBox.x2 - childBox.x1;
-
-        [minWidth, minHeight, naturalWidth, naturalHeight] = this._label.actor.get_preferred_size();
-
-        yPadding = Math.floor(Math.max(0, allocHeight - naturalHeight) / 2);
-        childBox.y1 = yPadding;
-        childBox.y2 = childBox.y1 + Math.min(naturalHeight, allocHeight);
-
-        if (direction == Clutter.TextDirection.LTR) {
-            childBox.x1 = Math.floor(iconWidth / 2);
-            childBox.x2 = Math.min(childBox.x1 + naturalWidth, allocWidth);
-        } else {
-            childBox.x2 = allocWidth - Math.floor(iconWidth / 2);
-            childBox.x1 = Math.max(0, childBox.x2 - naturalWidth);
-        }
-        this._label.actor.allocate(childBox, flags);
-
-        if (direction == Clutter.TextDirection.LTR) {
-            childBox.x1 = Math.floor(iconWidth / 2) + this._label.actor.width;
-            childBox.x2 = childBox.x1 + this._spinner.actor.width;
-            childBox.y1 = box.y1;
-            childBox.y2 = box.y2 - 1;
-            this._spinner.actor.allocate(childBox, flags);
-        } else {
-            childBox.x1 = -this._spinner.actor.width;
-            childBox.x2 = childBox.x1 + this._spinner.actor.width;
-            childBox.y1 = box.y1;
-            childBox.y2 = box.y2 - 1;
-            this._spinner.actor.allocate(childBox, flags);
-        }
-    },
-
-    _onAppStateChanged: function(appSys, app) {
-        let state = app.state;
-        if (state != Shell.AppState.STARTING) {
-            this._startingApps = this._startingApps.filter(function(a) {
-                return a != app;
-            });
-        } else if (state == Shell.AppState.STARTING) {
-            this._startingApps.push(app);
-        }
-        // For now just resync on all running state changes; this is mainly to handle
-        // cases where the focused window's application changes without the focus
-        // changing.  An example case is how we map OpenOffice.org based on the window
-        // title which is a dynamic property.
-        this._sync();
-    },
-
-    _focusAppChanged: function() {
-        let tracker = Shell.WindowTracker.get_default();
-        let focusedApp = tracker.focus_app;
-        if (!focusedApp) {
-            // If the app has just lost focus to the panel, pretend
-            // nothing happened; otherwise you can't keynav to the
-            // app menu.
-            if (global.stage_input_mode == Shell.StageInputMode.FOCUSED)
-                return;
-        }
-        this._sync();
+        this._workspacesChanged();
     },
 
     _sync: function() {
-        let tracker = Shell.WindowTracker.get_default();
-        let focusedApp = tracker.focus_app;
-        let lastStartedApp = null;
-        let workspace = global.screen.get_active_workspace();
-        for (let i = 0; i < this._startingApps.length; i++)
-            if (this._startingApps[i].is_on_workspace(workspace))
-                lastStartedApp = this._startingApps[i];
-
-        let targetApp = focusedApp != null ? focusedApp : lastStartedApp;
-
-        if (targetApp == null) {
-            if (!this._targetIsCurrent)
-                return;
-
-            this.actor.reactive = false;
-            this._targetIsCurrent = false;
-
-            Tweener.removeTweens(this.actor);
-            Tweener.addTween(this.actor, { opacity: 0,
-                                           time: Overview.ANIMATION_TIME,
-                                           transition: 'easeOutQuad' });
-            return;
-        }
-
-        if (!targetApp.is_on_workspace(workspace))
-            return;
-
-        if (!this._targetIsCurrent) {
-            this.actor.reactive = true;
-            this._targetIsCurrent = true;
-
-            Tweener.removeTweens(this.actor);
-            Tweener.addTween(this.actor, { opacity: 255,
-                                           time: Overview.ANIMATION_TIME,
-                                           transition: 'easeOutQuad' });
-        }
-
-        if (targetApp == this._targetApp) {
-            if (targetApp && targetApp.get_state() != Shell.AppState.STARTING) {
-                this.stopAnimation();
-
-                let win = global.display.focus_window;
-                if (!win._notifyTitleId) { this._initWindow(win); }
-                this._changeTitle(win, targetApp);
-
-                this._maybeSetMenu();
-            }
-            return;
-        }
-
         /* Added */
         let win = global.display.focus_window;
 
-        /* There are some (unknown) cases where there is no available focused window
-         * even though there is a focused app. Handle that. */
-        if(win == null) {
-            this._emptyTitle();
-        } else {
-            if (!win._notifyTitleId) {
-                this._initWindow(win);
-            }
-
-            this._changeTitle(win, targetApp)
-            /* End added */
-
-            this._spinner.actor.hide();
-            if (this._iconBox.child != null)
-                this._iconBox.child.destroy();
-            this._iconBox.hide();
-            //this._label.setText('');
-
-            disconnectTrackedSignals(this._targetAppSignals);
-            if (targetApp) {
-                connectAndTrack(this._targetAppSignals, targetApp,
-                    'notify::menu', Lang.bind(this, this._sync));
-                connectAndTrack(this._targetAppSignals, targetApp,
-                    'notify::action-group', Lang.bind(this, this._sync));
-            }
+        if (!win) {
+            return;
         }
 
-        this._targetApp = targetApp;
-        let icon = targetApp.get_faded_icon(2 * PANEL_ICON_SIZE, this._iconBox.text_direction);
-
-        //this._label.setText(targetApp.get_name());
-        this.setName(targetApp.get_name());
-
-        this._iconBox.set_child(icon);
-        this._iconBox.show();
-
-        if (targetApp.get_state() == Shell.AppState.STARTING)
-            this.startAnimation();
-        else
-            this._maybeSetMenu();
-
-        this.emit('changed');
-    },
-
-    _maybeSetMenu: function() {
-        let menu;
-
-        if (this._targetApp.action_group && this._targetApp.menu) {
-            if (this.menu instanceof PopupMenu.RemoteMenu &&
-                this.menu.actionGroup == this._targetApp.action_group)
-                return;
-
-            menu = new PopupMenu.RemoteMenu(this.actor, this._targetApp.menu, this._targetApp.action_group);
-        } else {
-            if (this.menu && !(this.menu instanceof PopupMenu.RemoteMenu))
-                return;
-
-            // fallback to older menu
-            menu = new PopupMenu.PopupMenu(this.actor, 0.0, St.Side.TOP, 0);
-            menu.addAction(_("Quit"), Lang.bind(this, function() {
-                this._targetApp.request_quit();
-            }));
+        this.parent();
+        
+        if (!win._notifyTitleId) {
+            this._initWindow(win);
         }
 
-        this.setMenu(menu);
-        this._menuManager.addMenu(menu);
+        let targetApp = this._findTargetApp();
+        this._setTitle(win, targetApp)
+        /* End added */
     },
 
-    _changeWorkspaces: function() {
-        disconnectTrackedSignals(this._wsSignals);
+    _workspacesChanged: function() {
+        Utils.disconnectTrackedSignals(this._wsSignals);
 
         for ( let i = 0; i < global.screen.n_workspaces; ++i ) {
             let ws = global.screen.get_workspace_by_index(i);
 
-            connectAndTrack(this._wsSignals, ws, 'window-removed',
-                Lang.bind(this, this._sync));
+            Utils.connectAndTrack(this._wsSignals, ws, 'window-removed',
+                    Lang.bind(this, this._sync));
         }
     },
 
@@ -481,25 +101,26 @@ const StatusTitleBarButton = new Lang.Class({
             win.disconnect(win._notifyTitleId);
         }
 
-        win._notifyTitleId = win.connect("notify::title", Lang.bind(this, this._onTitleChanged));
+        win._notifyTitleId = win.connect("notify::title", 
+                Lang.bind(this, this._onWindowTitleChanged));
     },
 
-    _onTitleChanged: function(win) {
+    _onWindowTitleChanged: function(win) {
         if (win.has_focus()) {
             let tracker = Shell.WindowTracker.get_default();
-            let app = tracker.get_window_app(win);
+            let app = this._findTargetApp();
 
-            this._changeTitle(win, app);
+            this._setTitle(win, app);
         }
     },
 
-    _changeTitle: function(win, app) {
+    _setTitle: function(win, app) {
         this._label.setText("");
         let maximizedFlags = Meta.MaximizeFlags.HORIZONTAL | Meta.MaximizeFlags.VERTICAL;
 
         if (win.get_maximized() == maximizedFlags) {
             this._label.setText(win.title);
-        } else {
+        } else if (app) {
             this._label.setText(app.get_name());
         }
     },
@@ -511,34 +132,37 @@ const StatusTitleBarButton = new Lang.Class({
     _onRedimension: function(shellwm, actor) {
         let win = actor.get_meta_window();
 
-        this._onTitleChanged(win);
+        this._onWindowTitleChanged(win);
     },
-    /** Add a 'destroy' method that disconnects all the signals
-     * (the actual AppMenu.Button class in panel.js doesn't do this!)
-     */
     destroy: function () {
         // disconnect signals
-        disconnectTrackedSignals(this);
+        Utils.disconnectTrackedSignals(this);
 
-        // any signals from _changeWorkspaces
-        disconnectTrackedSignals(this._wsSignals);
+        // any signals from _workspacesChanged
+        Utils.disconnectTrackedSignals(this._wsSignals);
 
-        // any signals from _initWindow. _sync requires the _notifyTitleId.
-        let windows = global.get_window_actors();
-        for (let i = 0; i < windows.length; ++i) {
-            let win = windows[i];
-            if (win._notifyTitleId) {
-                win.disconnect(win._notifyTitleId);
-                delete win._notifyTitleId;
-            }
-        }
-
-        // any signals from _sync
-        disconnectTrackedSignals(this._targetAppSignals);
+        // clear window signals
+        this._clearWindowsSignals();
 
         // Call parent destroy.
         this.parent();
-    }
+    },
+
+    _clearWindowsSignals: function() {
+        let windows = global.get_window_actors();
+
+        for (let i = 0; i < windows.length; ++i) {
+            // we need the MetaWindow here!
+            let win = windows[i].get_meta_window();
+            if (win._notifyTitleId) {
+                win.disconnect(win._notifyTitleId);
+            }
+
+            win._notifyTitleId = null;
+        }
+
+    },
+
 });
 
 Signals.addSignalMethods(StatusTitleBarButton.prototype);
@@ -546,43 +170,53 @@ Signals.addSignalMethods(StatusTitleBarButton.prototype);
 const StatusTitleBar = new Lang.Class({
     Name: 'StatusTitleBar',
 
-    _init: function(panel) {
-        this.panel = panel;
-        this.statusArea = panel.statusArea;
-        this.appMenu = this.statusArea.appMenu; // keep a reference to the default AppMenuButton
-
-        this.button = null;
+    _init: function() {
     }, 
 
     enable: function() {
-        this.button = new StatusTitleBarButton(this.panel.menuManager);
-
-        this.panel._leftBox.remove_actor(this.appMenu.actor.get_parent())
-
-        this.statusArea.appMenu = this.button;
-        let index = this.panel._leftBox.get_children().length;
-        this.panel._leftBox.insert_child_at_index(this.button.actor.get_parent(), index);
+        this._replaceAppMenu(new StatusTitleBarButton(Main.panel));
     },
 
     disable: function() {
-        this.panel.menuManager.removeMenu(this.button.menu);
-        this.panel._leftBox.remove_actor(this.button.actor.get_parent());
-        this.button.destroy();
+        this._replaceAppMenu(new Panel.AppMenuButton(Main.panel));
+    },
 
-        this.statusArea.appMenu = this.appMenu;
-        let index = Main.panel._leftBox.get_children().length;
-        Main.panel._leftBox.insert_child_at_index(this.appMenu.actor.get_parent(), index);
+    _replaceAppMenu: function(appMenu) {
+        let panel = Main.panel;
+        let statusArea = panel.statusArea;
 
-        this.button = null;
+        let oldAppMenu = statusArea.appMenu;
+        panel._leftBox.remove_actor(oldAppMenu.actor.get_parent());
+        oldAppMenu.destroy();
+
+        statusArea.appMenu = appMenu;
+        let index = panel._leftBox.get_children().length;
+        panel._leftBox.insert_child_at_index(appMenu.actor.get_parent(), index);
     }
 });
+
+// legacy support
+if (!Panel.AppMenuButton.prototype.hasOwnProperty("_findTargetApp")) {
+    StatusTitleBarButton.prototype._findTargetApp = function() {
+        let workspace = global.screen.get_active_workspace();
+        let tracker = Shell.WindowTracker.get_default();
+        let focusedApp = tracker.focus_app;
+        if (focusedApp && focusedApp.is_on_workspace(workspace))
+            return focusedApp;
+
+        for (let i = 0; i < this._startingApps.length; i++)
+            if (this._startingApps[i].is_on_workspace(workspace))
+                return this._startingApps[i];
+
+        return null;
+    }
+} 
 
 // lightweight object, acts only as a holder when ext disabled
 let statusTitleBar = null; 
 
 function init() {
-    let panel = Main.panel;
-    statusTitleBar = new StatusTitleBar(panel);
+    statusTitleBar = new StatusTitleBar();
 }
 
 function enable() {
